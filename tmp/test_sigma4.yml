@@ -1,0 +1,26 @@
+title: PowerShell Obfuscation Detection
+id: test-uuid-0001
+status: test
+description: Detection of PowerShell obfuscation techniques
+logsource:
+  product: windows
+  service: powershell
+  category: command_line
+detection:
+  selection:
+    CommandLine|contains|'$encodedCommand'
+  selection2:
+    CommandLine|contains|'AMSI'
+    CommandLine|contains|'bypass'
+  selection3:
+    CommandLine|contains|'[Ref].Assembly'
+    CommandLine|contains|'amsiInitFile'
+  condition: selection or selection2 or selection3
+falsepositives:
+  - Legitimate administration tasks using PowerShell
+level: high
+tags:
+  - mitre.technique T1059.001
+  - mitre.technique T1059
+  - obfuscation
+  - amsi_bypass

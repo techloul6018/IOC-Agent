@@ -1,0 +1,5 @@
+rule NoStrings
+{
+    condition:
+        true
+}

